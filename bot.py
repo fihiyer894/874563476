@@ -21,7 +21,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "887078537"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://78655.onrender.com")
 
 TURSO_URL = os.getenv("TURSO_URL", "https://1qaz2wsx-yhbvgt65.aws-eu-west-1.turso.io")
-TURSO_TOKEN = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...")
+TURSO_TOKEN = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE4MDc4NjA1NDEsImlhdCI6MTc3NjMyNDU0MSwiaWQiOiIwMTlkOTUyZC03YjAxLTc3N2QtYjE4NS03MDEzY2JjOWYwMDkiLCJyaWQiOiI3NmJlZDlhMy01Zjk1LTQ0OGYtYThkYi1kZTY2OTNmNjcwZTAifQ.fN9MZ5inviHOnUNqhrW20hbt1oUmHS6E2auA_grZ6pcv02NvEKEmrI5Ms_oSnwbBM1nTsR-TmE7SSIrB4utKDw")
 
 MAX_DB_RETRIES = 3
 DB_RETRY_DELAY = 2
@@ -40,6 +40,26 @@ app = Flask(__name__)
 # =========================
 # 🗄️ ПІДКЛЮЧЕННЯ ДО БД (TURSO)
 # =========================
+
+def _unpack_turso_value(v):
+    """Розпакувати значення Turso: {"type": "integer", "value": "5"} → 5"""
+    if isinstance(v, dict):
+        t = v.get("type", "")
+        val = v.get("value")
+        if val is None or t == "null":
+            return None
+        if t == "integer":
+            try:
+                return int(val)
+            except:
+                return val
+        if t == "float":
+            try:
+                return float(val)
+            except:
+                return val
+        return val  # text, blob — повертаємо як є
+    return v  # вже просте значення
 
 class QueryResult:
     """Результат запроса к БД"""
@@ -60,9 +80,12 @@ class QueryResult:
             
             if isinstance(first_row, dict):
                 if "values" in first_row:
-                    # Структура Turso - извлекаем values
+                    # Структура Turso — кожна клітинка може бути {"type":..., "value":...}
                     try:
-                        self.rows = [tuple(row.get("values", [])) for row in rows]
+                        self.rows = [
+                            tuple(_unpack_turso_value(v) for v in row.get("values", []))
+                            for row in rows
+                        ]
                         logger.info(f"📦 Turso format parsed: {len(self.rows)} rows")
                         logger.debug(f"Rows: {self.rows}")
                     except Exception as e:
@@ -71,7 +94,7 @@ class QueryResult:
                 else:
                     logger.warning(f"⚠️ Dict but no 'values' key: {list(first_row.keys())}")
                     try:
-                        self.rows = [tuple(first_row.values()) for row in rows]
+                        self.rows = [tuple(row.values()) for row in rows]
                     except:
                         self.rows = rows
             elif isinstance(first_row, (list, tuple)):
@@ -101,79 +124,91 @@ class TursoClient:
             "Content-Type": "application/json"
         }
     
-    def execute(self, query: str):
-        """Выполнить SQL запрос"""
+    def execute(self, query: str, args: list = None):
+        """Виконати SQL запит. args — список значень для підстановки замість ?"""
         try:
+            stmt = {"sql": query}
+            if args:
+                # Turso вимагає value завжди як рядок
+                turso_args = []
+                for a in args:
+                    if a is None:
+                        turso_args.append({"type": "null", "value": None})
+                    elif isinstance(a, bool):
+                        turso_args.append({"type": "integer", "value": str(int(a))})
+                    elif isinstance(a, int):
+                        turso_args.append({"type": "integer", "value": str(a)})
+                    elif isinstance(a, float):
+                        turso_args.append({"type": "float", "value": str(a)})
+                    else:
+                        turso_args.append({"type": "text", "value": str(a)})
+                stmt["args"] = turso_args
+
             payload = {
                 "requests": [
-                    {
-                        "type": "execute",
-                        "stmt": {
-                            "sql": query
-                        }
-                    }
+                    {"type": "execute", "stmt": stmt},
+                    {"type": "close"}
                 ]
             }
-            
+
             url = f"{self.url}/v2/pipeline"
-            logger.info(f"📡 SQL: {query[:100]}...")
-            
+            logger.info(f"📡 SQL: {query[:120]}")
+
             response = requests.post(
                 url,
                 json=payload,
                 headers=self.headers,
                 timeout=10
             )
-            
-            logger.debug(f"Status: {response.status_code}")
-            
+
+            logger.debug(f"HTTP status: {response.status_code}")
+
             if response.status_code != 200:
                 error_msg = f"DB Error ({response.status_code}): {response.text[:300]}"
                 logger.error(f"❌ {error_msg}")
                 raise Exception(error_msg)
-            
+
             result = response.json()
-            logger.debug(f"Full response: {json.dumps(result, default=str)[:500]}")
-            
-            # Проверяем структуру ответа
-            if not isinstance(result, dict) or "results" not in result:
-                logger.warning(f"⚠️ Unexpected response: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-                return QueryResult([])
-            
+            # Логуємо повну відповідь для налагодження
+            logger.info(f"📥 RAW response: {json.dumps(result, default=str)[:800]}")
+
+            # Turso /v2/pipeline повертає: {"results": [{"type": "ok", "response": {...}}, ...]}
             results = result.get("results", [])
-            if not results or len(results) == 0:
-                logger.warning(f"⚠️ Empty results")
+            if not results:
+                logger.warning("⚠️ Empty results array")
                 return QueryResult([])
-            
-            result_data = results[0]
-            logger.debug(f"result_data keys: {list(result_data.keys()) if isinstance(result_data, dict) else type(result_data)}")
-            
-            # Проверяем ошибку
-            error = result_data.get("error")
-            if error:
-                logger.error(f"❌ DB Error: {error}")
-                raise Exception(f"DB Error: {error}")
-            
-            # Получаем response объект
-            response_obj = result_data.get("response")
-            if response_obj is None:
-                logger.debug(f"⚠️ No response object, INSERT/UPDATE/DELETE success")
-                return QueryResult([])
-            
-            logger.debug(f"response_obj type: {type(response_obj)}, keys: {list(response_obj.keys()) if isinstance(response_obj, dict) else 'not dict'}")
-            
-            # Получаем rows
-            if isinstance(response_obj, dict):
+
+            first = results[0]
+
+            # Перевірка на помилку
+            if first.get("type") == "error":
+                err = first.get("error", {})
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                logger.error(f"❌ DB Error: {msg}")
+                raise Exception(f"DB Error: {msg}")
+
+            # Успішна відповідь
+            response_obj = first.get("response", {})
+            result_inner = response_obj.get("result", {}) if isinstance(response_obj, dict) else {}
+
+            # Спочатку пробуємо result_inner.rows (стандарт v2)
+            rows = None
+            if isinstance(result_inner, dict):
+                rows = result_inner.get("rows")
+                logger.debug(f"result_inner keys: {list(result_inner.keys())}, rows count: {len(rows) if rows is not None else 'None'}")
+
+            # Запасний варіант: rows прямо в response_obj
+            if rows is None and isinstance(response_obj, dict):
                 rows = response_obj.get("rows")
-                logger.debug(f"rows: type={type(rows)}, len={len(rows) if rows else 0}")
-                
-                if rows is not None:  # Может быть пустой список []
-                    logger.info(f"✅ SELECT: {len(rows)} rows")
-                    return QueryResult(rows)
-            
-            logger.debug(f"No rows in response, returning empty")
+
+            if rows is not None:
+                logger.info(f"✅ SELECT: {len(rows)} rows")
+                return QueryResult(rows)
+
+            # INSERT/UPDATE/DELETE — rows немає, це нормально
+            logger.debug("No rows (INSERT/UPDATE/DELETE or empty SELECT)")
             return QueryResult([])
-            
+
         except Exception as e:
             logger.error(f"❌ Query error: {e}", exc_info=True)
             raise
@@ -397,15 +432,11 @@ def get_trainer_description(message):
             return
         
         try:
-            username_escaped = escape_sql(data["username"])
-            name_escaped = escape_sql(data["name"])
-            desc_escaped = escape_sql(data["description"])
-            
-            query = f"""INSERT INTO trainers (username, name, description) 
-            VALUES ('{username_escaped}', '{name_escaped}', '{desc_escaped}')"""
+            query = "INSERT INTO trainers (username, name, description) VALUES (?, ?, ?)"
+            args = [data["username"], data["name"], data["description"]]
             
             logger.info(f"📤 Adding trainer: {data['name']}")
-            db.execute(query)
+            db.execute(query, args)
             
             logger.info(f"✅ Trainer added: {data['name']} ({data['display_username']})")
             bot.send_message(message.chat.id, f"✅ Trainer {data['name']} added!")
@@ -894,7 +925,45 @@ def webhook():
         logger.error(f"❌ Webhook: {e}")
     return '', 200
 
-@app.route('/health', methods=['GET'])
+@app.route('/debug', methods=['GET'])
+def debug_db():
+    """Діагностика БД — показує сирий відповідь Turso і список тренерів"""
+    try:
+        import json as _json
+
+        # 1. Сирий запит до Turso
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": {"sql": "SELECT id, name, username, description FROM trainers"}},
+                {"type": "close"}
+            ]
+        }
+        headers = {
+            "Authorization": f"Bearer {TURSO_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        raw = requests.post(f"{TURSO_URL}/v2/pipeline", json=payload, headers=headers, timeout=10)
+        raw_json = raw.json()
+
+        # 2. Через наш клієнт
+        db = get_db_client()
+        parsed_rows = []
+        if db:
+            try:
+                result = db.execute("SELECT id, name, username, description FROM trainers")
+                parsed_rows = [list(r) for r in result.rows]
+            except Exception as e:
+                parsed_rows = [f"ERROR: {e}"]
+
+        return _json.dumps({
+            "http_status": raw.status_code,
+            "raw_turso_response": raw_json,
+            "parsed_rows": parsed_rows
+        }, ensure_ascii=False, indent=2), 200, {"Content-Type": "application/json"}
+    except Exception as e:
+        return _json.dumps({"error": str(e)}, ensure_ascii=False), 500
+
+
 def health():
     """Health"""
     try:
