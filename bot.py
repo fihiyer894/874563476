@@ -21,7 +21,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ТВІЙ_ТОКЕН_БОТА")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "887078537"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://78655.onrender.com")
 
-TURSO_URL = os.getenv("TURSO_URL", "libsql://1qaz2wsx-yhbvgt65.aws-eu-west-1.turso.io")
+# ✅ ИСПРАВЛЕНО: Правильная конфигурация URL
+TURSO_URL = os.getenv("TURSO_URL", "https://1qaz2wsx-yhbvgt65.aws-eu-west-1.turso.io")
 TURSO_TOKEN = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE4MDc4NjA1NDEsImlhdCI6MTc3NjMyNDU0MSwiaWQiOiIwMTlkOTUyZC03YjAxLTc3N2QtYjE4NS03MDEzY2JjOWYwMDkiLCJyaWQiOiI3NmJlZDlhMy01Zjk1LTQ0OGYtYThkYi1kZTY2OTNmNjcwZTAifQ.fN9MZ5inviHOnUNqhrW20hbt1oUmHS6E2auA_grZ6pcv02NvEKEmrI5Ms_oSnwbBM1nTsR-TmE7SSIrB4utKDw")
 
 # Максимальное количество попыток переподключения
@@ -47,7 +48,11 @@ class TursoClient:
     """Синхронный клиент для Turso БД через REST API"""
     
     def __init__(self, url: str, auth_token: str):
-        self.url = url
+        # ✅ ИСПРАВЛЕНО: Конвертация libsql:// в https://
+        if url.startswith("libsql://"):
+            url = url.replace("libsql://", "https://", 1)
+        
+        self.url = url.rstrip("/")  # Убрать слеш в конце если есть
         self.auth_token = auth_token
         self.headers = {
             "Authorization": f"Bearer {auth_token}",
@@ -57,32 +62,54 @@ class TursoClient:
     def execute(self, query: str, params: list = None):
         """Выполнить SQL запрос"""
         try:
+            # ✅ ИСПРАВЛЕНО: Правильная структура для Turso API v2
             payload = {
-                "statements": [
+                "requests": [
                     {
-                        "sql": query,
-                        "args": params or []
+                        "type": "execute",
+                        "stmt": {
+                            "sql": query,
+                            "args": params or []
+                        }
                     }
                 ]
             }
             
+            # ✅ ИСПРАВЛЕНО: Правильный URL для запроса
+            url = f"{self.url}/v2/pipeline"
+            logger.debug(f"📡 Отправка запроса на: {url}")
+            logger.debug(f"📤 Payload: {payload}")
+            
             response = requests.post(
-                f"{self.url}/v2/pipeline",
+                url,
                 json=payload,
                 headers=self.headers,
                 timeout=10
             )
             
+            logger.debug(f"📥 Response status: {response.status_code}")
+            logger.debug(f"📥 Response body: {response.text}")
+            
             if response.status_code != 200:
-                raise Exception(f"DB Error: {response.text}")
+                error_msg = f"DB Error (status {response.status_code}): {response.text}"
+                logger.error(f"❌ {error_msg}")
+                raise Exception(error_msg)
             
             result = response.json()
             
-            # Обработка результатов
+            # ✅ ИСПРАВЛЕНО: Правильная обработка результатов для v2 API
             if result.get("results"):
                 result_data = result["results"][0]
-                if result_data.get("rows"):
-                    return QueryResult(result_data["rows"])
+                
+                # Проверяем поле "response"
+                if result_data.get("response"):
+                    response_data = result_data["response"]
+                    if response_data.get("rows"):
+                        return QueryResult(response_data["rows"])
+                    elif response_data.get("result"):
+                        return QueryResult([])
+                    return QueryResult([])
+                
                 return QueryResult([])
             
             return QueryResult([])
@@ -133,14 +160,14 @@ def get_db_client(retry_count=0):
     try:
         if client is None:
             if retry_count < MAX_DB_RETRIES:
-                logger.warning(f"⚠️ Повна {retry_count + 1} спроба переподключення...")
+                logger.warning(f"⚠️ Спроба {retry_count + 1} переподключення...")
                 time.sleep(DB_RETRY_DELAY)
                 if init_client():
                     return client
                 else:
                     return get_db_client(retry_count + 1)
             else:
-                logger.error(f"❌ Не вдалось підключитися після {MAX_DB_RETRIES} спроб")
+                logger.error(f"❌ Не вда��ось підключитися після {MAX_DB_RETRIES} спроб")
                 return None
         
         # Тест живого з'єднання
@@ -451,7 +478,7 @@ def list_trainers(message):
 # 👤 ВИБІР ТРЕНЕРА (КОРИСТУВАЧ)
 # =========================
 
-@bot.message_handler(func=lambda message: message.text == "Вибрат�� тренера")
+@bot.message_handler(func=lambda message: message.text == "Вибрати тренера")
 def choose_trainer_start(message):
     """Початок процесу вибору тренера"""
     try:
@@ -641,7 +668,7 @@ def cancel_selection(message):
         user_form.pop(message.chat.id, None)
         
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add("Вибрати тренера", "Зв'язатися з адмініст��атором")
+        markup.add("Вибрати тренера", "Зв'язатися з адміністратором")
         
         bot.send_message(message.chat.id, "Скасовано. Головне меню:", reply_markup=markup)
     except Exception as e:
